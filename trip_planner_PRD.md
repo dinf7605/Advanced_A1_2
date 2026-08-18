@@ -347,6 +347,31 @@ data = json.loads(response.text)
 > 신형 `google-genai`(`from google import genai`)는 **호출 방식이 다릅니다.**
 > 이 문서는 신형 기준으로 작성했습니다.
 
+> ⚠️ **Gemini에도 타임아웃을 걸어야 합니다.** Kakao(`requests`)에는 `timeout=10`을 뒀으면서
+> Gemini SDK에는 빠뜨렸다가, 리포트 생성 단계에서 프로그램이 멈춘 것처럼 보이는 일을 겪었습니다.
+>
+> ```python
+> client = genai.Client(api_key=key,
+>                       http_options=types.HttpOptions(timeout=120000))  # 밀리초
+> ```
+>
+> **단위가 밀리초입니다** (`requests`는 초). 실측상 리포트 생성 1회에 **43초**가 걸렸으므로
+> 60초는 너무 빠듯해 120초로 잡았습니다.
+>
+> 그리고 오래 걸리는 호출은 **라벨을 먼저 찍고 결과를 나중에 붙여야** 합니다.
+> `[6/6] 리포트 생성`을 완료 후에 출력하면, 그 40여 초 동안 화면에 아무 변화가 없어
+> 사용자는 프로그램이 죽은 줄 압니다. 503 재시도 중에도 안내를 출력합니다.
+>
+> ```python
+> log_start(6, "리포트 생성")     # 호출 전에 라벨을 찍는다
+> markdown = generate_report(...)
+> log_end("완료")
+> ```
+>
+> 💡 SDK가 매 호출마다 찍는 AFC(automatic function calling) 안내도 진행 로그 중간에
+> 끼어듭니다. 이 프로그램은 함수 호출을 쓰지 않으므로 로거를 낮춥니다.
+> `logging.getLogger("google_genai.models").setLevel(logging.ERROR)`
+
 **프롬프트 설계 원칙 (실측으로 개정됨)**
 
 > ⚠️ **초안의 원칙 1번은 틀렸습니다.** 처음에는 "출력 형식을 예시 JSON으로 보여준다"로
@@ -964,6 +989,7 @@ A1-1과 동일하게 유지합니다.
 |--------|------|
 | ~~Gemini 모델명이 문서와 다름~~ | ✅ **해소** — `gemini-3.6-flash`로 확정. `models.list`에 있어도 404가 날 수 있음 (§5.1) |
 | ~~Gemini SDK 패키지명이 문서와 다름~~ | ✅ **해소** — `google-genai 2.18.1`, `from google import genai` 동작 확인 |
+| ~~리포트 단계에서 멈춘 것처럼 보임~~ | ✅ **해소** — Gemini에 120초 타임아웃 부여 + 호출 전에 라벨 출력 (§5.1) |
 | **Gemini 무료 한도 하루 20회 소진** | 실행 1회당 Gemini 2회 호출 → 하루 약 10회. **캐싱(§9) 필수.** 막히면 다른 flash 모델로 교체 (한도는 모델별) |
 | ~~LLM이 JSON을 코드블록으로 감싸 반환~~ | ✅ **해소** — 예시 블록 제거 + `response_schema` 적용 후 실패 0건 (§5.1) |
 | ~~Kakao 앱 플랫폼 미등록으로 403~~ | ✅ **해소** — 실제 호출 200 확인 (2026-08-18) |

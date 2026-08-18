@@ -8,6 +8,7 @@
 """
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -22,12 +23,17 @@ from google.genai import types
 sys.stdout.reconfigure(encoding="utf-8")  # cp949 터미널에서 이모지가 깨지지 않도록
 sys.stderr.reconfigure(encoding="utf-8")  # argparse 오류 메시지가 stderr로 나간다
 
+# SDK가 매 호출마다 찍는 AFC 안내가 진행 로그 중간에 끼어들어 화면을 어지럽힌다.
+# 이 프로그램은 함수 호출(tool use)을 쓰지 않으므로 해당 안내는 의미가 없다.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+
 # --- 설정 상수 ---------------------------------------------------------------
 GEMINI_MODEL = "gemini-3.6-flash"
 KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
 RESULTS_DIR = "results"
 RESTAURANT_COUNT = 5          # 맛집 검색 개수 (권장 5곳)
-REQUEST_TIMEOUT = 10          # 초. 생략하면 서버 무응답 시 프로그램이 영원히 멈춘다
+REQUEST_TIMEOUT = 10          # 초. Kakao 호출용
+GEMINI_TIMEOUT_MS = 120000    # 밀리초(2분). 리포트 생성은 40초 이상 걸리기도 한다. 생략하면 서버 무응답 시 영원히 멈춘다
 SERVER_RETRY = 3              # 503(모델 과부하) 재시도 횟수
 SERVER_BACKOFF = 2            # 초. 재시도 간격(회차마다 배수로 증가)
 TOTAL_STEPS = 6
@@ -52,13 +58,41 @@ def _width(text):
     return sum(2 if ord(ch) > 0x1100 else 1 for ch in text)
 
 
+_pending = None  # 결과를 기다리는 중인 (단계, 라벨)
+
+
+def _dots(label):
+    return "." * max(2, 26 - _width(label))
+
+
+def log_start(step, label):
+    """호출 '전에' 라벨을 찍는다. 응답이 늦어도 멈춘 것처럼 보이지 않는다."""
+    global _pending
+    print(f"[{step}/{TOTAL_STEPS}] {label} {_dots(label)} ", end="", flush=True)
+    _pending = (step, label)
+
+
+def log_end(status):
+    global _pending
+    print(status)
+    _pending = None
+
+
 def log(step, label, status):
-    dots = "." * max(2, 26 - _width(label))
-    print(f"[{step}/{TOTAL_STEPS}] {label} {dots} {status}")
+    log_start(step, label)
+    log_end(status)
 
 
 def log_detail(message):
+    """진행 중인 줄이 있으면 닫았다가 다시 열어 준다."""
+    global _pending
+    keep = _pending
+    if keep:
+        print()
+        _pending = None
     print(f"      → {message}")
+    if keep:
+        log_start(*keep)
 
 
 def print_header(date_str):
@@ -167,7 +201,11 @@ def call_gemini(client, prompt, as_json, schema=None):
         except genai_errors.ServerError as exc:
             last_error = exc
             if attempt < SERVER_RETRY - 1:
-                time.sleep(SERVER_BACKOFF * (attempt + 1))
+                wait = SERVER_BACKOFF * (attempt + 1)
+                # 조용히 기다리면 사용자는 프로그램이 멈춘 줄 안다
+                log_detail(f"서버가 혼잡합니다(503). {wait}초 후 재시도 "
+                           f"({attempt + 1}/{SERVER_RETRY - 1})")
+                time.sleep(wait)
     raise last_error
 
 
@@ -295,7 +333,7 @@ def search_restaurants(city, kakao_key, errors):
     """맛집을 검색한다. 어떤 실패든 빈 리스트를 돌려주고 프로그램은 계속된다."""
     if not kakao_key:
         record_error(errors, "kakao_search", "auth", "KAKAO_REST_API_KEY 미설정")
-        log(4, "맛집 검색", "⚠ 건너뜀 (KAKAO_REST_API_KEY 미설정)")
+        log_end("⚠ 건너뜀 (KAKAO_REST_API_KEY 미설정)")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
@@ -313,13 +351,13 @@ def search_restaurants(city, kakao_key, errors):
 
     except requests.exceptions.Timeout:
         record_error(errors, "kakao_search", "network", f"{REQUEST_TIMEOUT}초 내 응답 없음")
-        log(4, "맛집 검색", "⚠ 실패 (응답 시간 초과)")
+        log_end("⚠ 실패 (응답 시간 초과)")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     except requests.exceptions.ConnectionError:
         record_error(errors, "kakao_search", "network", "네트워크 연결 실패")
-        log(4, "맛집 검색", "⚠ 실패 (네트워크 연결)")
+        log_end("⚠ 실패 (네트워크 연결)")
         log_detail("인터넷 연결을 확인해 주세요. 리포트 생성은 계속합니다")
         return []
 
@@ -333,24 +371,24 @@ def search_restaurants(city, kakao_key, errors):
         record_error(errors, "kakao_search",
                      {401: "auth", 403: "auth", 429: "quota"}.get(status, "api"),
                      f"HTTP {status}")
-        log(4, "맛집 검색", f"⚠ 실패 (HTTP {status})")
+        log_end(f"⚠ 실패 (HTTP {status})")
         log_detail(hints.get(status, "카카오 서버 오류입니다. 잠시 후 다시 시도하세요"))
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     except (ValueError, KeyError) as exc:
         record_error(errors, "kakao_search", "parse", f"응답 형식이 예상과 다름: {exc}")
-        log(4, "맛집 검색", "⚠ 실패 (응답 파싱)")
+        log_end("⚠ 실패 (응답 파싱)")
         return []
 
     if not documents:
         record_error(errors, "kakao_search", "empty", f"'{city} 맛집' 검색 결과 0건")
-        log(4, "맛집 검색", "0건")
+        log_end("0건")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     restaurants = [normalize_place(doc) for doc in documents]
-    log(4, "맛집 검색", f"완료 ({len(restaurants)}곳)")
+    log_end(f"완료 ({len(restaurants)}곳)")
     return restaurants
 
 
@@ -536,7 +574,11 @@ def main():
     if not kakao_key:
         log_detail("KAKAO_REST_API_KEY 미설정 — 맛집 검색을 건너뜁니다")
 
-    client = genai.Client(api_key=gemini_key)
+    client = genai.Client(
+        api_key=gemini_key,
+        # 타임아웃이 없으면 서버가 응답하지 않을 때 예외조차 없이 영원히 멈춘다
+        http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+    )
     cached = load_cache(date_str)
 
     if cached:
@@ -550,8 +592,10 @@ def main():
         log(5, "원본 데이터 저장", "건너뜀 (기존 파일 유지)")
     else:
         log(2, "캐시 확인", "없음, 새로 생성합니다")
+        log_start(3, "여행지 추천 요청")
         recommendation = get_recommendation(client, date_str, errors)
-        log(3, "여행지 추천 요청", f"완료 → {recommendation['recommended_city']}")
+        log_end(f"완료 → {recommendation['recommended_city']}")
+        log_start(4, "맛집 검색")
         restaurants = search_restaurants(recommendation["recommended_city"], kakao_key, errors)
         save_raw({
             "input_date": date_str,
@@ -562,9 +606,10 @@ def main():
         }, date_str)
         log(5, "원본 데이터 저장", "완료")
 
+    log_start(6, "리포트 생성")
     markdown = generate_report(client, date_str, recommendation, restaurants, errors)
     save_report(append_error_section(markdown, errors), date_str)
-    log(6, "리포트 생성", "완료")
+    log_end("완료")
 
     print_footer(date_str, errors)
 
