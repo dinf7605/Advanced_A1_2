@@ -7,9 +7,11 @@
     python trip_planner.py -date "2026-09-20"
 """
 import argparse
+import difflib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,7 +31,7 @@ logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 # --- 설정 상수 ---------------------------------------------------------------
 GEMINI_MODEL = "gemini-3.6-flash"
-KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
+DEFAULT_PLACE_PROVIDER = "kakao"   # 환경변수 PLACE_PROVIDER로 교체 가능
 RESULTS_DIR = "results"
 RESTAURANT_COUNT = 5          # 맛집 검색 개수 (권장 5곳)
 REQUEST_TIMEOUT = 10          # 초. Kakao 호출용
@@ -37,6 +39,7 @@ GEMINI_TIMEOUT_MS = 120000    # 밀리초(2분). 리포트 생성은 40초 이�
 SERVER_RETRY = 3              # 503(모델 과부하) 재시도 횟수
 SERVER_BACKOFF = 2            # 초. 재시도 간격(회차마다 배수로 증가)
 TOTAL_STEPS = 6
+CITY_MATCH_CUTOFF = 0.8       # 도시명 오타 보정의 자모 유사도 기준
 KST = timezone(timedelta(hours=9))
 
 # 1차 추천 JSON 스키마. API 레벨에서 필수 키와 타입을 강제한다.
@@ -148,14 +151,17 @@ def record_error(errors, stage, type_, message):
 
 # --- 설정 -------------------------------------------------------------------
 def load_api_keys():
-    """환경변수 또는 .env에서 키를 읽는다.
+    """Gemini 키를 환경변수 또는 .env에서 읽는다.
+
+    장소 검색 제공자의 자격증명은 제공자 어댑터가 스스로 관리한다
+    (PlaceProvider.credentials). 제공자마다 필요한 키 개수와 이름이 다르기 때문이다.
+    Kakao는 REST 키 1개, Naver는 Client ID/Secret 2개를 쓴다.
 
     load_dotenv()는 호출한 스크립트 파일의 위치를 기준으로 .env를 찾는다.
     이 파일은 프로젝트 폴더에 있으므로 같은 폴더의 .env가 잡힌다.
     """
     load_dotenv()
     gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    kakao_key = (os.getenv("KAKAO_REST_API_KEY") or "").strip()
 
     if not gemini_key:
         # Gemini가 없으면 추천도 리포트도 만들 수 없다 → 즉시 종료
@@ -172,7 +178,7 @@ def load_api_keys():
         print("   키 발급: https://aistudio.google.com/apikey")
         sys.exit(1)
 
-    return gemini_key, kakao_key
+    return gemini_key
 
 
 # --- LLM (Gemini) ------------------------------------------------------------
@@ -296,6 +302,15 @@ def get_recommendation(client, date_str, errors):
             continue
 
         data["events"] = [e.strip() for e in data["events"] if e.strip()][:3]
+
+        # LLM은 같은 도시를 '제주', '제주도', '경주 (경상북도)' 등으로 다르게 답한다.
+        # 이 값이 그대로 장소 검색 질의어가 되므로 표준명으로 다듬는다.
+        raw_city = data["recommended_city"]
+        city, notes = normalize_city(raw_city)
+        data["recommended_city"] = city
+        if city != raw_city:
+            data["recommended_city_raw"] = raw_city   # 무엇이 바뀌었는지 결과에 남긴다
+            data["normalization"] = notes
         return data
 
     # 재시도까지 실패. 도시 이름이 없으면 맛집 검색도 리포트도 만들 수 없다.
@@ -305,7 +320,133 @@ def get_recommendation(client, date_str, errors):
     sys.exit(1)
 
 
-# --- 지도/장소 (Kakao Local) --------------------------------------------------
+# --- 도시명 정규화 -------------------------------------------------------------
+# LLM은 같은 도시를 '제주', '제주도', '제주특별자치도', '제주 (제주도)' 등으로 다르게 답한다.
+# 이 값이 그대로 장소 검색 질의어가 되므로, 검색에 넣기 전에 표준명으로 다듬는다.
+
+# 표준명 직접 매핑. 접미사 제거만으로 처리되지 않는 것들을 여기서 먼저 거른다.
+CITY_ALIASES = {
+    "제주도": "제주", "제주특별자치도": "제주", "제주시": "제주",
+    "서울특별시": "서울", "부산광역시": "부산", "대구광역시": "대구",
+    "인천광역시": "인천", "광주광역시": "광주", "대전광역시": "대전",
+    "울산광역시": "울산", "세종특별자치시": "세종",
+    "강원특별자치도": "강원", "전북특별자치도": "전주",
+}
+
+# 접미사는 '가장 긴 것부터' 검사한다. '특별자치도'를 '도'보다 먼저 봐야 한다.
+ADMIN_SUFFIXES = ("특별자치도", "특별자치시", "특별시", "광역시",
+                  "자치시", "자치도", "시", "군", "구", "도")
+
+# 근사 매칭(오타 보정)의 기준이 되는 국내 주요 여행지.
+KNOWN_CITIES = [
+    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+    "제주", "서귀포", "강릉", "속초", "동해", "삼척", "양양", "평창", "춘천", "원주",
+    "경주", "안동", "포항", "울진", "영덕", "문경", "상주", "구미",
+    "전주", "군산", "남원", "여수", "순천", "목포", "광양", "담양", "보성",
+    "통영", "거제", "남해", "진주", "김해", "양산", "밀양",
+    "충주", "제천", "단양", "청주", "공주", "부여", "보령", "태안", "서산",
+    "가평", "양평", "파주", "수원", "인제", "정선", "홍천", "태백",
+]
+
+
+def _jamo(text):
+    """한글 음절을 초성·중성·종성으로 분해한다.
+
+    '강릉'과 '갱릉'은 글자 단위로 보면 2자 중 1자만 같아 유사도가 0.5에 그친다.
+    자모로 풀면 ㄱㅏㅇㄹㅡㅇ / ㄱㅐㅇㄹㅡㅇ 로 6개 중 5개가 같아 0.83이 되어
+    오타를 잡아낼 수 있다. 한글 두 글자 이름이 많아 이 처리가 필요하다.
+    """
+    out = []
+    for ch in text:
+        code = ord(ch) - 0xAC00
+        if 0 <= code <= 11171:
+            out.append(chr(0x1100 + code // 588))
+            out.append(chr(0x1161 + (code % 588) // 28))
+            tail = code % 28
+            if tail:
+                out.append(chr(0x11A7 + tail))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _closest_known_city(name):
+    """자모 유사도로 가장 가까운 표준 도시명을 찾는다. 없으면 None."""
+    target = _jamo(name)
+    best, best_score = None, 0.0
+    for city in KNOWN_CITIES:
+        score = difflib.SequenceMatcher(None, target, _jamo(city)).ratio()
+        if score > best_score:
+            best, best_score = city, score
+    return best if best_score >= CITY_MATCH_CUTOFF else None
+
+
+def normalize_city(raw):
+    """LLM이 준 도시명을 검색용 표준명으로 정규화한다.
+
+    (정규화된 이름, 무엇을 했는지 설명 목록)을 돌려준다.
+    설명 목록은 로그와 결과 JSON에 남겨, 무엇이 왜 바뀌었는지 추적할 수 있게 한다.
+    """
+    notes = []
+    name = (raw or "").strip().strip("\"'")
+
+    # 1) 괄호와 그 내용 제거 — '경주 (경상북도)' 처럼 부연이 붙어 오는 경우
+    without_paren = re.sub(r"[（(\[][^）)\]]*[）)\]]", "", name).strip()
+    if without_paren != name:
+        notes.append("괄호 제거")
+        name = without_paren
+
+    # 2) 내부 공백 정리 — '강 릉' 같은 경우
+    collapsed = re.sub(r"\s+", "", name)
+    if collapsed != name:
+        notes.append("공백 제거")
+        name = collapsed
+
+    if not name:
+        return raw, ["정규화 실패 — 원본 유지"]
+
+    # 3) 표준명 직접 매핑
+    if name in CITY_ALIASES:
+        mapped = CITY_ALIASES[name]
+        notes.append(f"표준명 매핑 → '{mapped}'")
+        return mapped, notes
+
+    # 4) 이미 표준 도시명이면 접미사를 떼지 않는다.
+    #    '대구'에서 '구'를 떼면 '대'가 되어 버린다.
+    if name in KNOWN_CITIES:
+        return name, notes
+
+    # 5) 행정 접미사 제거 (한 번만, 결과가 두 글자 이상일 때만)
+    for suffix in ADMIN_SUFFIXES:
+        if name.endswith(suffix) and len(name) - len(suffix) >= 2:
+            stripped = name[: -len(suffix)]
+            notes.append(f"접미사 '{suffix}' 제거")
+            name = stripped
+            break
+
+    if name in CITY_ALIASES:
+        mapped = CITY_ALIASES[name]
+        notes.append(f"표준명 매핑 → '{mapped}'")
+        return mapped, notes
+    if name in KNOWN_CITIES:
+        return name, notes
+
+    # 6) 오타 보정 — 자모 유사도로 가장 가까운 표준 도시명을 찾는다
+    guess = _closest_known_city(name)
+    if guess and guess != name:
+        notes.append(f"오타 보정 '{name}' → '{guess}'")
+        return guess, notes
+
+    # 알려진 도시가 아니어도 검색은 시도한다. 목록에 없는 여행지일 수 있다.
+    return name, notes
+
+
+# --- 지도/장소 제공자 어댑터 ---------------------------------------------------
+# 제공자를 갈아끼울 수 있도록 어댑터로 분리했다.
+# 공통 흐름(요청·타임아웃·HTTP 오류 분기·0건 처리·로그)은 search_restaurants()가 맡고,
+# 제공자마다 다른 부분만 어댑터가 담당한다. 새 제공자를 붙이려면
+# PlaceProvider를 상속해 아래 훅을 채우고 PLACE_PROVIDERS에 등록하면 된다.
+
 def to_float(value):
     try:
         return float(value)
@@ -313,81 +454,223 @@ def to_float(value):
         return None
 
 
-def normalize_place(doc):
-    """Kakao 응답을 우리 스키마로 변환한다.
+def strip_tags(text):
+    """검색어 강조용 <b> 같은 태그를 제거한다 (Naver 응답의 title에 섞여 온다)."""
+    return re.sub(r"<[^>]+>", "", text or "")
 
-    주의: x가 경도(lng), y가 위도(lat)이며 둘 다 문자열로 온다.
+
+class PlaceProvider:
+    """지도/장소 검색 제공자 인터페이스.
+
+    구현해야 하는 것은 다섯 가지다.
+      required_env      : 필요한 환경변수 이름들
+      build_request     : 검색 요청의 URL·헤더·파라미터
+      extract_documents : 응답 본문에서 결과 목록을 꺼내는 방법
+      normalize         : 제공자 응답 1건을 공통 스키마로 변환
+      hint              : HTTP 오류 코드별 점검 안내 (제공자마다 원인이 다르다)
+    """
+
+    name = ""
+    label = ""
+    required_env = ()
+
+    def credentials(self):
+        """필요한 환경변수를 모아 온다. 하나라도 비어 있으면 None."""
+        values = {key: (os.getenv(key) or "").strip() for key in self.required_env}
+        return values if all(values.values()) else None
+
+    def missing_env(self):
+        return [k for k in self.required_env if not (os.getenv(k) or "").strip()]
+
+    def build_request(self, city, count, creds):
+        raise NotImplementedError
+
+    def extract_documents(self, payload):
+        raise NotImplementedError
+
+    def normalize(self, doc):
+        raise NotImplementedError
+
+    def hint(self, status):
+        return "제공자 서버 오류입니다. 잠시 후 다시 시도하세요"
+
+
+class KakaoPlaceProvider(PlaceProvider):
+    """Kakao Local 키워드 검색.
+
+    응답의 x가 경도(lng), y가 위도(lat)이며 둘 다 문자열로 온다.
     화면 좌표 감각으로 x를 위도에 넣으면 지도에 엉뚱한 위치가 찍힌다.
     """
-    return {
-        "name": doc.get("place_name", ""),
-        "address": doc.get("road_address_name") or doc.get("address_name", ""),
-        "category": doc.get("category_name", ""),
-        "url": doc.get("place_url", ""),
-        "lat": to_float(doc.get("y")),
-        "lng": to_float(doc.get("x")),
-    }
+
+    name = "kakao"
+    label = "Kakao Local"
+    required_env = ("KAKAO_REST_API_KEY",)
+    URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
+
+    def build_request(self, city, count, creds):
+        return {
+            "url": self.URL,
+            "headers": {"Authorization": f"KakaoAK {creds['KAKAO_REST_API_KEY']}"},
+            "params": {"query": f"{city} 맛집",
+                       "size": count,
+                       "category_group_code": "FD6"},   # 음식점으로 한정
+        }
+
+    def extract_documents(self, payload):
+        return payload["documents"]
+
+    def normalize(self, doc):
+        return {
+            "name": doc.get("place_name", ""),
+            "address": doc.get("road_address_name") or doc.get("address_name", ""),
+            "category": doc.get("category_name", ""),
+            "url": doc.get("place_url", ""),
+            "lat": to_float(doc.get("y")),
+            "lng": to_float(doc.get("x")),
+        }
+
+    def hint(self, status):
+        return {
+            401: "KAKAO_REST_API_KEY 값과 헤더의 'KakaoAK ' 접두어를 확인하세요",
+            403: "카카오 개발자 사이트에서 앱 플랫폼 등록과 API 사용 설정을 확인하세요",
+            429: "일일 호출 한도를 초과했습니다. 내일 다시 시도하세요",
+        }.get(status, super().hint(status))
 
 
-def search_restaurants(city, kakao_key, errors):
-    """맛집을 검색한다. 어떤 실패든 빈 리스트를 돌려주고 프로그램은 계속된다."""
-    if not kakao_key:
-        record_error(errors, "kakao_search", "auth", "KAKAO_REST_API_KEY 미설정")
-        log_end("⚠ 건너뜀 (KAKAO_REST_API_KEY 미설정)")
+class NaverPlaceProvider(PlaceProvider):
+    """Naver 지역 검색.
+
+    ⚠️ 실제 자격증명이 없어 호출 검증을 하지 못했다.
+    아래 두 가지는 Naver 응답의 알려진 특징이며, 키를 발급받으면 먼저 확인할 것.
+      - title에 검색어 강조용 <b> 태그가 섞여 온다 → strip_tags()로 제거
+      - mapx/mapy가 정수로 오며 경위도에 10^7을 곱한 값이다 → 나눠서 환산
+        (계정·버전에 따라 좌표계가 다를 수 있으므로 첫 호출에서 값을 눈으로 확인할 것)
+    """
+
+    name = "naver"
+    label = "Naver Local Search"
+    required_env = ("NAVER_CLIENT_ID", "NAVER_CLIENT_SECRET")
+    URL = "https://openapi.naver.com/v1/search/local.json"
+    COORD_SCALE = 10 ** 7
+
+    def build_request(self, city, count, creds):
+        return {
+            "url": self.URL,
+            "headers": {"X-Naver-Client-Id": creds["NAVER_CLIENT_ID"],
+                        "X-Naver-Client-Secret": creds["NAVER_CLIENT_SECRET"]},
+            "params": {"query": f"{city} 맛집", "display": count, "sort": "random"},
+        }
+
+    def extract_documents(self, payload):
+        return payload["items"]
+
+    def _coord(self, value):
+        number = to_float(value)
+        if number is None:
+            return None
+        # 경위도면 소수점 값(127.0), 10^7 배수면 큰 정수(1270000000)로 온다
+        return number / self.COORD_SCALE if abs(number) > 1000 else number
+
+    def normalize(self, doc):
+        return {
+            "name": strip_tags(doc.get("title", "")),
+            "address": doc.get("roadAddress") or doc.get("address", ""),
+            "category": doc.get("category", ""),
+            "url": doc.get("link", ""),
+            "lat": self._coord(doc.get("mapy")),
+            "lng": self._coord(doc.get("mapx")),
+        }
+
+    def hint(self, status):
+        return {
+            401: "NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 값과 헤더 이름 철자를 확인하세요",
+            403: "네이버 개발자센터에서 해당 앱의 검색 API 사용 설정을 확인하세요",
+            429: "일일 호출 한도를 초과했습니다. 내일 다시 시도하세요",
+        }.get(status, super().hint(status))
+
+
+PLACE_PROVIDERS = {
+    KakaoPlaceProvider.name: KakaoPlaceProvider,
+    NaverPlaceProvider.name: NaverPlaceProvider,
+}
+
+
+def get_place_provider(name=None):
+    """팩토리. 환경변수 PLACE_PROVIDER로 제공자를 갈아끼운다 (기본: kakao)."""
+    key = (name or os.getenv("PLACE_PROVIDER") or DEFAULT_PLACE_PROVIDER).strip().lower()
+    provider_class = PLACE_PROVIDERS.get(key)
+    if provider_class is None:
+        print()
+        print(f"❌ 알 수 없는 장소 검색 제공자입니다: {key!r}")
+        print(f"   사용 가능: {', '.join(sorted(PLACE_PROVIDERS))}")
+        print("   환경변수 PLACE_PROVIDER 값을 확인하세요.")
+        sys.exit(1)
+    return provider_class()
+
+
+def search_restaurants(city, provider, errors, count=None):
+    """맛집을 검색한다. 어떤 실패든 빈 리스트를 돌려주고 프로그램은 계속된다.
+
+    제공자에 따라 달라지는 부분은 전부 provider 어댑터가 담당하므로,
+    이 함수는 제공자가 바뀌어도 그대로다.
+    """
+    count = count or RESTAURANT_COUNT
+    stage = f"{provider.name}_search"
+    creds = provider.credentials()
+
+    if creds is None:
+        missing = ", ".join(provider.missing_env())
+        record_error(errors, stage, "auth", f"{missing} 미설정")
+        log_end(f"⚠ 건너뜀 ({missing} 미설정)")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
+    request = provider.build_request(city, count, creds)
     try:
         response = requests.get(
-            KAKAO_URL,
-            headers={"Authorization": f"KakaoAK {kakao_key}"},
-            params={"query": f"{city} 맛집",
-                    "size": RESTAURANT_COUNT,
-                    "category_group_code": "FD6"},
+            request["url"],
+            headers=request["headers"],
+            params=request["params"],
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
-        documents = response.json()["documents"]
+        documents = provider.extract_documents(response.json())
 
     except requests.exceptions.Timeout:
-        record_error(errors, "kakao_search", "network", f"{REQUEST_TIMEOUT}초 내 응답 없음")
+        record_error(errors, stage, "network", f"{REQUEST_TIMEOUT}초 내 응답 없음")
         log_end("⚠ 실패 (응답 시간 초과)")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     except requests.exceptions.ConnectionError:
-        record_error(errors, "kakao_search", "network", "네트워크 연결 실패")
+        record_error(errors, stage, "network", "네트워크 연결 실패")
         log_end("⚠ 실패 (네트워크 연결)")
         log_detail("인터넷 연결을 확인해 주세요. 리포트 생성은 계속합니다")
         return []
 
     except requests.exceptions.HTTPError as exc:
         status = exc.response.status_code
-        hints = {
-            401: "KAKAO_REST_API_KEY 값과 헤더의 'KakaoAK ' 접두어를 확인하세요",
-            403: "카카오 개발자 사이트에서 앱 플랫폼 등록과 API 사용 설정을 확인하세요",
-            429: "일일 호출 한도를 초과했습니다. 내일 다시 시도하세요",
-        }
-        record_error(errors, "kakao_search",
+        record_error(errors, stage,
                      {401: "auth", 403: "auth", 429: "quota"}.get(status, "api"),
                      f"HTTP {status}")
         log_end(f"⚠ 실패 (HTTP {status})")
-        log_detail(hints.get(status, "카카오 서버 오류입니다. 잠시 후 다시 시도하세요"))
+        log_detail(provider.hint(status))
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     except (ValueError, KeyError) as exc:
-        record_error(errors, "kakao_search", "parse", f"응답 형식이 예상과 다름: {exc}")
+        record_error(errors, stage, "parse", f"응답 형식이 예상과 다름: {exc}")
         log_end("⚠ 실패 (응답 파싱)")
+        log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
     if not documents:
-        record_error(errors, "kakao_search", "empty", f"'{city} 맛집' 검색 결과 0건")
+        record_error(errors, stage, "empty", f"'{city} 맛집' 검색 결과 0건")
         log_end("0건")
         log_detail("맛집은 '데이터 없음'으로 리포트에 표기됩니다")
         return []
 
-    restaurants = [normalize_place(doc) for doc in documents]
+    restaurants = [provider.normalize(doc) for doc in documents]
     log_end(f"완료 ({len(restaurants)}곳)")
     return restaurants
 
@@ -568,11 +851,13 @@ def main():
 
     print_header(date_str)
 
-    gemini_key, kakao_key = load_api_keys()
-    ready = "Gemini, Kakao" if kakao_key else "Gemini"
+    gemini_key = load_api_keys()
+    provider = get_place_provider()
+    ready = f"Gemini, {provider.label}" if provider.credentials() else "Gemini"
     log(1, "API 키 확인", f"완료 ({ready})")
-    if not kakao_key:
-        log_detail("KAKAO_REST_API_KEY 미설정 — 맛집 검색을 건너뜁니다")
+    if not provider.credentials():
+        missing = ", ".join(provider.missing_env())
+        log_detail(f"{missing} 미설정 — 맛집 검색을 건너뜁니다")
 
     client = genai.Client(
         api_key=gemini_key,
@@ -595,11 +880,17 @@ def main():
         log_start(3, "여행지 추천 요청")
         recommendation = get_recommendation(client, date_str, errors)
         log_end(f"완료 → {recommendation['recommended_city']}")
-        log_start(4, "맛집 검색")
-        restaurants = search_restaurants(recommendation["recommended_city"], kakao_key, errors)
+        if recommendation.get("recommended_city_raw"):
+            log_detail("도시명 정규화: "
+                       f"'{recommendation['recommended_city_raw']}' → "
+                       f"'{recommendation['recommended_city']}' "
+                       f"({', '.join(recommendation['normalization'])})")
+        log_start(4, f"맛집 검색 ({provider.label})")
+        restaurants = search_restaurants(recommendation["recommended_city"], provider, errors)
         save_raw({
             "input_date": date_str,
             "generated_at": datetime.now(KST).isoformat(timespec="seconds"),
+            "place_provider": provider.name,
             "recommendation": recommendation,
             "restaurants": restaurants,
             "errors": errors,

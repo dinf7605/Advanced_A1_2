@@ -66,6 +66,11 @@ trip_planner.py: error: argument -date/--date: 날짜는 0을 채운 8자리로 
 |----------|--------|--------|
 | `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/apikey) | **즉시 종료** (추천도 리포트도 불가) |
 | `KAKAO_REST_API_KEY` | [Kakao Developers](https://developers.kakao.com) → 내 애플리케이션 → 앱 키 | 맛집만 "데이터 없음"으로 두고 **계속 진행** |
+| `PLACE_PROVIDER` | (선택) `kakao` 또는 `naver` | 기본값 `kakao` |
+| `NAVER_CLIENT_ID`<br>`NAVER_CLIENT_SECRET` | [네이버 개발자센터](https://developers.naver.com) | `PLACE_PROVIDER=naver`일 때만 필요 |
+
+장소 검색 제공자는 **코드를 고치지 않고 `PLACE_PROVIDER`로 교체**할 수 있습니다.
+자세한 구조는 [지도/장소 제공자 교체](#지도장소-제공자-교체)를 보십시오.
 
 > ⚠️ **카카오는 키가 4종류입니다.** 이 프로그램은 서버에서 HTTP로 직접 호출하므로
 > **REST API 키**를 씁니다. 네이티브 앱 키·JavaScript 키는 맞지 않고,
@@ -287,6 +292,129 @@ Python 버전과 설치된 패키지 3종을 확인했습니다.
 
 ---
 
+## 지도/장소 제공자 교체
+
+**장소 검색 제공자는 코드를 고치지 않고 환경변수로 갈아끼울 수 있습니다.**
+
+```
+PLACE_PROVIDER=kakao     # 기본값
+PLACE_PROVIDER=naver
+```
+
+| 제공자 | 필요한 자격증명 | 상태 |
+|--------|----------------|------|
+| `kakao` — Kakao Local | `KAKAO_REST_API_KEY` | ✅ 실제 호출 검증 완료 |
+| `naver` — Naver Local Search | `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` | ⚠️ 자격증명 미발급으로 **실호출 미검증** (정규화 로직만 합성 응답으로 검증) |
+
+### 어댑터 구조
+
+제공자마다 다른 것은 **요청 형태·응답 구조·오류 원인** 세 가지뿐입니다.
+타임아웃, HTTP 오류 분기, 0건 처리, 로그 출력은 어느 제공자든 똑같습니다.
+그래서 **다른 부분만 어댑터로 분리하고 같은 부분은 한 군데 두었습니다.**
+
+```
+search_restaurants(city, provider, errors)     ← 공통 흐름 (제공자가 바뀌어도 그대로)
+   │
+   ├─ provider.credentials()        자격증명이 갖춰졌는가
+   ├─ provider.build_request()      URL · 헤더 · 파라미터
+   ├─ provider.extract_documents()  응답에서 결과 목록 꺼내기
+   ├─ provider.normalize()          제공자 응답 → 공통 스키마
+   └─ provider.hint(status)         오류 코드별 점검 안내
+```
+
+새 제공자를 붙이려면 `PlaceProvider`를 상속해 위 다섯 개를 채우고
+`PLACE_PROVIDERS`에 등록하면 됩니다. `search_restaurants()`는 건드리지 않습니다.
+
+```python
+PLACE_PROVIDERS = {
+    KakaoPlaceProvider.name: KakaoPlaceProvider,
+    NaverPlaceProvider.name: NaverPlaceProvider,
+}
+
+def get_place_provider(name=None):          # 팩토리 진입점
+    key = (name or os.getenv("PLACE_PROVIDER") or DEFAULT_PLACE_PROVIDER).strip().lower()
+    ...
+```
+
+### 두 제공자가 같은 결과를 내놓는가
+
+같은 가게를 각 제공자의 응답 형식으로 넣어 정규화한 결과입니다.
+
+| | Kakao | Naver |
+|---|-------|-------|
+| 이름 필드 | `place_name` | `title` — **`<b>` 태그가 섞여 와서 제거** |
+| 주소 | `road_address_name` → `address_name` | `roadAddress` → `address` |
+| 좌표 | `x`/`y` — **문자열** 경위도 | `mapx`/`mapy` — **정수**, 경위도 × 10⁷ |
+| 링크 | `place_url` | `link` |
+
+```
+Kakao  →  {'name': '옥야식당',      'lat': 36.56383941785355, 'lng': 128.72348964282705, ...}
+Naver  →  {'name': '안동찜닭 본점',  'lat': 36.5638394,        'lng': 128.7234896, ...}
+```
+
+키 집합과 값 타입이 동일합니다. 뒤따르는 리포트 생성 코드는 어느 제공자에서 왔는지
+알 필요가 없습니다. 어느 제공자로 만든 결과인지는 원본 JSON의 `place_provider`에 남습니다.
+
+---
+
+## 추천 도시명 정규화
+
+LLM은 같은 도시를 매번 다르게 표기합니다 — `제주`, `제주도`, `제주특별자치도`,
+`경주 (경상북도)`, `강 릉`. **이 값이 그대로 장소 검색 질의어가 되므로** 검색에 넣기 전에
+표준명으로 다듬습니다.
+
+| 단계 | 처리 | 예 |
+|:---:|------|-----|
+| 1 | 괄호와 그 안의 내용 제거 | `경주 (경상북도)` → `경주` |
+| 2 | 내부 공백 제거 | `강 릉` → `강릉` |
+| 3 | 표준명 직접 매핑 | `제주특별자치도` → `제주` |
+| 4 | **표준 도시명이면 여기서 중단** | `대구` → `대구` |
+| 5 | 행정 접미사 1회 제거 | `경주시` → `경주`, `정선군` → `정선` |
+| 6 | 오타 보정 (자모 유사도) | `갱릉` → `강릉` |
+
+### 왜 4단계에서 멈추는가
+
+접미사 목록에 `구`가 있습니다. `대구`에서 이걸 떼면 **`대`** 가 됩니다.
+그래서 이미 알려진 표준 도시명이면 접미사 제거를 아예 시도하지 않고,
+제거 결과가 두 글자 미만이면 원본을 유지합니다.
+
+### 왜 자모로 분해해 비교하는가
+
+한글 도시명은 두 글자가 많습니다. `갱릉`과 `강릉`을 **글자 단위**로 비교하면
+2자 중 1자만 같아 유사도가 0.5에 그쳐 오타로 잡히지 않습니다.
+
+자모로 풀면 `ㄱㅏㅇㄹㅡㅇ` / `ㄱㅐㅇㄹㅡㅇ` 가 되어 6개 중 5개가 일치, 유사도 0.83이 됩니다.
+기준값 0.8을 넘겨 보정됩니다.
+
+```
+'제주도'          → 제주        표준명 매핑
+'경주 (경상북도)'  → 경주        괄호 제거
+'강 릉'           → 강릉        공백 제거
+'대구'            → 대구        (표준명 — 접미사 제거하지 않음)
+'서귀포시'         → 서귀포      접미사 '시' 제거
+'갱릉'            → 강릉        오타 보정
+'경쥬'            → 경주        오타 보정
+```
+
+원본과 달라지면 로그와 결과 JSON에 **무엇을 왜 바꿨는지** 남깁니다.
+
+```
+[3/6] 여행지 추천 요청 .......... 완료 → 제주
+      → 도시명 정규화: '제주특별자치도' → '제주' (표준명 매핑 → '제주')
+```
+
+```json
+"recommendation": {
+  "recommended_city": "제주",
+  "recommended_city_raw": "제주특별자치도",
+  "normalization": ["표준명 매핑 → '제주'"]
+}
+```
+
+목록에 없는 지명은 **그대로 두고 검색을 시도합니다.** 표준 도시 목록에 없다고
+버리면 잘 알려지지 않은 여행지를 추천받았을 때 검색조차 못 하게 됩니다.
+
+
 ## 설계 결정 (왜 이렇게 만들었는가)
 
 ### 1. 왜 프롬프트에 JSON 예시를 넣지 않는가
@@ -424,6 +552,31 @@ Gemini를 **2회**(추천 + 리포트) 호출하므로, **하루 약 10회 실�
 
 둘 다 횟수가 고정되어 있어 무한 재시도가 되지 않습니다.
 
+### 10. 왜 제공자를 어댑터로 분리했는가
+
+과제 요건은 "Kakao 또는 Naver 중 택1"입니다. 하나만 구현하면 요건은 충족되지만,
+**제공자를 바꾸려면 `search_restaurants()` 전체를 고쳐야 합니다.** 그 함수에는
+제공자와 무관한 것(타임아웃, 오류 분기, 0건 처리, 로그)이 훨씬 많이 들어 있어서,
+바꿔야 할 부분과 그대로 둘 부분이 뒤섞입니다.
+
+제공자마다 실제로 다른 것은 세 가지뿐입니다 — **요청 형태, 응답 구조, 오류 원인.**
+이 셋만 어댑터로 빼면 나머지는 공유됩니다. 실제로 Naver 어댑터를 추가할 때
+`search_restaurants()`는 한 줄도 고치지 않았습니다.
+
+오류 안내도 제공자별로 갈립니다. 같은 401이어도 Kakao는 `KakaoAK ` 접두어를,
+Naver는 `X-Naver-Client-Id` 헤더 이름을 확인해야 합니다. 그래서 `hint(status)`를
+어댑터의 책임으로 두었습니다.
+
+### 11. 왜 도시명을 정규화하는가
+
+LLM 출력을 다음 API의 **입력으로 그대로 쓰기 때문**입니다.
+`recommended_city`가 `제주특별자치도`나 `경주 (경상북도)`로 오면 그대로 검색어가 되어
+결과가 나빠지거나 0건이 됩니다. 프롬프트로 "도시 이름만"이라고 지시해도 매번 지켜지지는 않습니다.
+
+**프롬프트로 부탁하는 것과 코드로 보장하는 것은 다릅니다.** 형식은 `response_schema`가,
+값의 형태는 정규화 함수가 보장합니다. 자세한 규칙은
+[추천 도시명 정규화](#추천-도시명-정규화)에 있습니다.
+
 ---
 
 ## 코드 구조
@@ -436,7 +589,8 @@ Gemini를 **2회**(추천 + 리포트) 호출하므로, **하루 약 10회 실�
 | CLI | `valid_date()`, `parse_args()` |
 | 설정 | `load_api_keys()` |
 | LLM | `call_gemini()`, `build_recommend_prompt()`, `build_retry_prompt()`, `get_recommendation()`, `validate_recommendation()` |
-| 지도 | `search_restaurants()`, `normalize_place()`, `to_float()` |
+| 도시명 정규화 | `normalize_city()`, `_jamo()`, `_closest_known_city()` |
+| 지도 (어댑터) | `PlaceProvider` (인터페이스), `KakaoPlaceProvider`, `NaverPlaceProvider`, `get_place_provider()` (팩토리), `search_restaurants()` (공통 흐름) |
 | 리포트 | `build_report_prompt()`, `generate_report()`, `build_fallback_report()`, `append_error_section()` |
 | 저장·캐시 | `save_raw()`, `save_report()`, `load_cache()`, `raw_path()`, `report_path()` |
 

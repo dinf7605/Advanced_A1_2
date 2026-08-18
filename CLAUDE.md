@@ -17,7 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 항목 | 확정 | PRD |
 |------|------|-----|
 | LLM | Google Gemini **`gemini-3.6-flash`** (`google-genai` 2.18.1) | §5.1 |
-| 지도/장소 | Kakao Local 키워드 검색 | §5.2 |
+| 지도/장소 | **어댑터 구조** — 기본 `kakao`, `PLACE_PROVIDER`로 교체 (`naver` 구현됨) | §5.2 |
 | 보너스 | **캐싱만** 채택 — `recommended_city`는 **단수 문자열** | §0, §9 |
 | 파일 구성 | `trip_planner.py` 단일 파일 | §0 |
 
@@ -72,6 +72,18 @@ python trip_planner.py -date "2026-09-20"
 - 콘솔 이모지 출력을 위해 `sys.stdout.reconfigure(encoding="utf-8")`를 파일 상단에 둡니다.
   없으면 cp949 터미널에서 `UnicodeEncodeError`로 중단됩니다.
 - A1-1과 달리 **외부 라이브러리를 사용합니다** (`google-genai`, `requests`, `python-dotenv`).
+
+## 구조 (평가 피드백 반영)
+
+- **장소 검색은 어댑터로 분리되어 있다.** 제공자별로 다른 것은 `build_request` /
+  `extract_documents` / `normalize` / `hint` / `credentials` 다섯 훅뿐이고, 타임아웃·HTTP 오류
+  분기·0건 처리·로그는 `search_restaurants()`에 공통으로 있다. **새 제공자를 붙일 때
+  `search_restaurants()`를 고치지 말 것.** `PlaceProvider`를 상속하고 `PLACE_PROVIDERS`에 등록한다.
+- **`NaverPlaceProvider`는 실호출 검증이 안 됐다.** 자격증명이 없어 합성 응답으로 정규화만
+  확인했다. 좌표(`mapx`/`mapy`) 스케일은 계정·버전에 따라 다를 수 있으니 첫 호출에서 확인할 것.
+- **`recommended_city`는 검색에 쓰기 전에 `normalize_city()`를 거친다.** 괄호 제거 →
+  공백 제거 → 표준명 매핑 → 접미사 제거 → 자모 유사도 오타 보정 순서다.
+  **순서를 바꾸지 말 것** — 표준 도시명 확인이 접미사 제거보다 앞에 있어야 `대구`가 `대`가 되지 않는다.
 
 ## 측정으로 확정된 것 (되돌리지 말 것)
 
