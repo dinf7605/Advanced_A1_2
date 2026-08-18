@@ -236,12 +236,24 @@ python trip_planner.py -date "2026-09-20"
 **검증은 `argparse`의 `type=` 함수에서 합니다.** 직접 `if`로 검사하지 않습니다.
 
 ```python
-def valid_date(s):
+def valid_date(value):
     try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
-        raise argparse.ArgumentTypeError(f"날짜 형식이 올바르지 않습니다: {s!r} (예: 2026-09-20)")
+        raise argparse.ArgumentTypeError(
+            f"날짜 형식이 올바르지 않습니다: {value!r} (예: 2026-09-20)")
+
+    # strptime은 0을 뺀 표기도 받아들인다(2026-9-20 통과). 왕복 비교로 걸러낸다.
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError(
+            f"날짜는 0을 채운 8자리로 써야 합니다: {value!r} → {parsed.isoformat()!r}")
+    return parsed
 ```
+
+> ⚠️ **초안의 오류를 실행해 보고 발견했습니다.** 처음에는 `strptime` 하나면 충분하다고
+> 적었지만, **파이썬의 `%m`·`%d`는 0을 뺀 한 자리 표기도 받아들입니다.**
+> 그래서 `2026-9-20`이 그대로 통과해 API 호출까지 진행됐습니다.
+> 파싱 결과를 다시 문자열로 만들어(`isoformat()`) 입력과 비교해야 막힙니다.
 
 `ArgumentTypeError`를 던지면 argparse가 **사용법(usage)을 자동 출력하고 exit code 2로 종료**합니다.
 과제 요건 "형식이 올바르지 않으면 사용법을 출력하고 종료"가 이 한 가지로 충족됩니다.
@@ -249,10 +261,14 @@ def valid_date(s):
 `strptime`을 쓰는 이유는 형식과 실재 여부를 **동시에** 걸러내기 때문입니다.
 정규식(`\d{4}-\d{2}-\d{2}`)만 쓰면 `2026-13-45` 같은 값이 통과합니다.
 
+> 💡 **`sys.stderr`도 UTF-8로 고정해야 합니다.** argparse는 오류 메시지를 **stdout이 아니라
+> stderr로** 출력합니다. `sys.stdout`만 재설정하면 cp949 터미널에서 날짜 오류 안내가
+> 깨져 나옵니다. 실제로 겪고 고쳤습니다.
+
 | 입력 | 결과 |
 |------|------|
 | `2026-09-20` | ✅ 통과 |
-| `2026-9-20` | ❌ 형식 불일치 (`%m`은 2자리) |
+| `2026-9-20` | ❌ 왕복 비교에서 차단 (**`strptime`만으로는 통과함** — 위 경고 참고) |
 | `2026/09/20` | ❌ 구분자 불일치 |
 | `2026-13-01` | ❌ 13월 없음 |
 | `2026-02-30` | ❌ 존재하지 않는 날 |
@@ -281,7 +297,8 @@ def valid_date(s):
 | 항목 | 값 |
 |------|-----|
 | SDK | `google-genai` (`from google import genai`) |
-| 모델 | `gemini-3.5-flash` |
+| 모델 | `gemini-3.6-flash` |
+| 스키마 강제 | `response_schema=RECOMMEND_SCHEMA` |
 | 환경변수 | `GEMINI_API_KEY` |
 | 출력 강제 | `response_mime_type="application/json"` |
 
@@ -291,16 +308,30 @@ from google.genai import types
 
 client = genai.Client(api_key=api_key)
 response = client.models.generate_content(
-    model="gemini-3.5-flash",
+    model="gemini-3.6-flash",
     contents=prompt,
     config=types.GenerateContentConfig(response_mime_type="application/json"),
 )
 data = json.loads(response.text)
 ```
 
-> ✅ **모델 ID 검증 완료 (2026-08-18)** — `models.list` 호출 결과 `gemini-3.5-flash`가
-> 계정에서 사용 가능한 모델로 확인됐습니다. (같은 계열의 `gemini-3.5-flash-lite`도 있으므로
-> `-lite`를 잘못 붙이지 않도록 주의)
+> ✅ **모델 확정: `gemini-3.6-flash` (2026-08-18 실측)**
+>
+> 선택 과정에서 두 번 걸렸습니다.
+>
+> | 후보 | 결과 |
+> |------|------|
+> | `gemini-3.5-flash` | 호출은 되지만 **무료 한도가 하루 20회**라 개발 중 금방 소진 |
+> | `gemini-2.5-flash` | `models.list`에는 보이지만 호출 시 **404** — "no longer available to new users" |
+> | **`gemini-3.6-flash`** | ✅ 정상 동작. 위 404 응답이 직접 지목한 대체 모델 |
+>
+> ⚠️ **`models.list`에 있다고 호출 가능한 것이 아닙니다.** 목록에는 계정이 쓸 수 없는
+> 모델도 함께 나옵니다. 실제 호출을 한 번 해봐야 확인됩니다.
+>
+> ⚠️ **무료 한도는 모델별로 따로 잡힙니다** (`GenerateRequestsPerDayPerProjectPerModel`).
+> 한 모델이 429로 막혀도 다른 모델은 쓸 수 있습니다. 전체 실행 1회에 Gemini를
+> **2회**(추천 + 리포트) 호출하므로, 하루 20회면 약 10회 실행분입니다.
+> **캐싱(§9)이 보너스가 아니라 사실상 필수인 이유입니다.**
 >
 > 재확인이 필요하면 아래로 목록을 다시 뽑을 수 있습니다. **키 인증 확인을 겸합니다.**
 >
@@ -316,12 +347,28 @@ data = json.loads(response.text)
 > 신형 `google-genai`(`from google import genai`)는 **호출 방식이 다릅니다.**
 > 이 문서는 신형 기준으로 작성했습니다.
 
-**프롬프트 설계 원칙**
+**프롬프트 설계 원칙 (실측으로 개정됨)**
 
-1. 출력 형식을 **예시 JSON으로** 보여준다 (설명만 하지 않는다).
-2. "코드블록(```) 없이 JSON만 출력"을 명시한다 — `json.loads`가 백틱에서 깨진다.
-3. 각 키의 **타입과 개수 제약**을 문장으로 못 박는다 (`events`는 문자열 배열 1~3개).
-4. 국내 여행지로 한정한다 — 다음 단계가 국내 장소 검색 API이기 때문.
+> ⚠️ **초안의 원칙 1번은 틀렸습니다.** 처음에는 "출력 형식을 예시 JSON으로 보여준다"로
+> 적었는데, 실제로 재보니 **그게 실패 원인이었습니다.**
+>
+> | 프롬프트 | 결과 |
+> |----------|------|
+> | 예시 JSON 블록 **포함** | 완료 5건 중 **4건 파싱 실패** |
+> | 예시 없이 **산문으로만** 지시 | 10건 중 **0건 실패** |
+>
+> 실패 형태가 두 가지였습니다.
+> - `Extra data: line 10 column 1` — **프롬프트의 예시 객체를 먼저 출력하고 그 뒤에
+>   진짜 답을 이어 붙여** JSON 객체가 두 개가 됨
+> - `Expecting ',' delimiter: line 8` — `reason` 문자열 중간이 깨짐
+>
+> **`response_mime_type="application/json"`은 "JSON 하나만"을 보장하지 않습니다.**
+> 형식은 `response_schema`에 맡기고, 프롬프트는 내용만 지시합니다.
+
+1. **예시 JSON 블록을 넣지 않는다.** 구조는 `response_schema`가 강제한다.
+2. 각 키에 **무엇을 담을지**를 산문으로 지시한다 (`events`는 행사명 1~3개).
+3. 국내 여행지로 한정한다 — 다음 단계가 국내 장소 검색 API이기 때문.
+4. 재시도용 프롬프트(§E3)는 **더 짧게** 만든다. 같은 프롬프트로 다시 물으면 같은 실패가 반복된다.
 
 ```
 당신은 국내 여행 플래너입니다.
@@ -541,7 +588,9 @@ documents = resp.json()["documents"]
 | E1 | 날짜 형식 오류 / `-date` 누락 | Fatal | argparse가 **사용법 출력 + exit 2** (§4.2) |
 | E2 | `GEMINI_API_KEY` 미설정 | Fatal | 설정 방법 안내 출력 후 **exit 1** |
 | E3 | 1차 추천 JSON 파싱 실패 **또는 스키마 검증 실패** | 재시도 | **필수 키만 출력하도록 프롬프트를 축약해 1회 재시도.** 2회째도 실패하면 exit 1 |
-| E4 | Gemini 호출 자체 실패 (네트워크/인증/쿼터) | Fatal | 원인 안내 후 exit 1 |
+| E4 | Gemini 호출 자체 실패 (네트워크/인증) | Fatal | 원인 안내 후 exit 1 |
+| E4-a | Gemini `503 UNAVAILABLE` (모델 과부하) | 재시도 | **3회까지 2·4초 간격으로 재시도.** 일시적 오류라 잠시 뒤 대개 풀림 |
+| E4-b | Gemini `429 RESOURCE_EXHAUSTED` (무료 한도 초과) | Fatal | 한도 소진 안내 후 exit 1. 재시도해도 그날은 풀리지 않음 |
 | E5 | Kakao 검색 결과 **0건** | Degraded | `restaurants=[]`, `errors`에 `type:"empty"` 기록, **리포트 계속** |
 | E6 | Kakao `401`/`403` | Degraded | 키·헤더·플랫폼 설정 점검 안내 출력, `restaurants=[]`, **리포트 계속** |
 | E7 | Kakao `429` (쿼터) | Degraded | 한도 초과 안내, `restaurants=[]`, **리포트 계속** |
@@ -554,6 +603,12 @@ documents = resp.json()["documents"]
 > 데이터 없음 처리하고 리포트 생성은 계속"이라고 명시했습니다. 키가 없는 것도 그 API를
 > 쓸 수 없는 상황이므로 같은 정책을 적용합니다. 반면 `GEMINI_API_KEY`가 없으면
 > 1차 추천도 리포트도 만들 수 없어 프로그램이 할 일이 남지 않으므로 E2는 Fatal입니다.
+
+> **E4-a의 재시도가 "무한 재시도 금지"에 걸리지 않는 이유** — 과제 제약이 금지한 것은
+> **JSON 파싱 실패에 대한 재요청**이며 그것은 E3에서 정확히 1회로 묶여 있습니다.
+> E4-a는 전송 계층에서 서버가 "지금 붐빈다"고 답한 경우로 성격이 다르고,
+> 횟수가 3회로 고정되어 있어 무한 루프가 되지 않습니다.
+> 실측에서 `gemini-3.6-flash` 이전 모델은 8건 중 7건이 503으로 실패할 만큼 잦았습니다.
 
 > **E10의 대체 생성** — 리포트는 이 프로그램의 최종 산출물입니다. LLM이 실패했다고
 > 빈손으로 끝내면 요건 "최종 리포트 Markdown 1개"가 깨집니다. 이미 `recommendation`과
@@ -767,7 +822,7 @@ results/trip_{date}_raw.json 존재?
 
 - [ ] `argparse` 구성, `valid_date()` 검증 (§4.2)
 - [ ] 잘못된 날짜 5종 테스트 (T1~T5)
-- [x] ~~모델명 확인~~ → `gemini-3.5-flash` 확정 (§5.1)
+- [x] ~~모델명 확인~~ → `gemini-3.6-flash` 확정 (§5.1)
 - [ ] Gemini **SDK 설치 방식** 확인 — `pip install google-genai` 후 import 경로 확인
 - [ ] `get_recommendation()` 1차 버전 — 호출 + `json.loads`
 - [ ] 응답을 그대로 출력해 형식 확인
@@ -814,20 +869,22 @@ results/trip_{date}_raw.json 존재?
 
 ### 13.1 수동 테스트 시나리오
 
-| ID | 시나리오 | 기대 결과 |
-|----|----------|-----------|
-| T1 | `-date` 없이 실행 | 사용법 출력 + 종료 |
-| T2 | `-date "2026-9-20"` | 형식 오류 안내 + 사용법 + 종료 |
-| T3 | `-date "2026/09/20"` | 형식 오류 안내 + 종료 |
-| T4 | `-date "2026-13-01"` | 형식 오류 안내 + 종료 |
-| T5 | `-date "2026-09-20"` (정상) | 전 과정 수행 + 두 파일 생성 |
-| T6 | `GEMINI_API_KEY`를 지우고 실행 | 설정 방법 안내 + 즉시 종료 (E2) |
-| T7 | `KAKAO_REST_API_KEY`를 틀린 값으로 설정 | 401 안내 + **맛집 "데이터 없음"으로 리포트 생성 완료** (E6) |
-| T8 | 검색 0건이 나오는 도시로 강제 실행 | 중단 없이 "데이터 없음" 리포트 (E5) |
-| T9 | 네트워크를 끊고 실행 | 타임아웃 처리, 프로그램이 멈추지 않음 (E8) |
-| T10 | 같은 `-date`로 재실행 | **캐시 사용 로그** 출력, API 미호출 (§9) |
-| T11 | `results/*_raw.json`을 지우고 재실행 | 정상 경로로 재수행 |
-| T12 | 생성된 JSON에 `errors` 키 존재 확인 | 성공 시에도 `"errors": []`로 존재 |
+> ✅ **T1~T12 전부 통과 (2026-08-18 실행 확인)**
+
+| ID | 시나리오 | 기대 결과 | 결과 |
+|----|----------|-----------|:----:|
+| T1 | `-date` 없이 실행 | 사용법 출력 + 종료 | ✅ |
+| T2 | `-date "2026-9-20"` | 형식 오류 안내 + 사용법 + 종료 | ✅ |
+| T3 | `-date "2026/09/20"` | 형식 오류 안내 + 종료 | ✅ |
+| T4 | `-date "2026-13-01"` | 형식 오류 안내 + 종료 | ✅ |
+| T5 | `-date "2026-09-20"` (정상) | 전 과정 수행 + 두 파일 생성 | ✅ |
+| T6 | `GEMINI_API_KEY`를 지우고 실행 | 설정 방법 안내 + 즉시 종료 (E2) | ✅ |
+| T7 | `KAKAO_REST_API_KEY`를 틀린 값으로 설정 | 401 안내 + **맛집 "데이터 없음"으로 리포트 생성 완료** (E6) | ✅ |
+| T8 | 검색 0건이 나오는 도시로 강제 실행 | 중단 없이 "데이터 없음" 리포트 (E5) | ✅ |
+| T9 | 네트워크를 끊고 실행 | 타임아웃 처리, 프로그램이 멈추지 않음 (E8) | ✅ |
+| T10 | 같은 `-date`로 재실행 | **캐시 사용 로그** 출력, API 미호출 (§9) | ✅ |
+| T11 | `results/*_raw.json`을 지우고 재실행 | 정상 경로로 재수행 | ✅ |
+| T12 | 생성된 JSON에 `errors` 키 존재 확인 | 성공 시에도 `"errors": []`로 존재 | ✅ |
 
 > **T7이 이 과제에서 가장 중요한 테스트입니다.** 요구사항 6의 "지도 API 실패 시에도 리포트
 > 생성은 계속"을 직접 증명합니다. 스크린샷으로 남기십시오.
@@ -905,11 +962,15 @@ A1-1과 동일하게 유지합니다.
 
 | 리스크 | 대응 |
 |--------|------|
-| ~~Gemini 모델명이 문서와 다름~~ | ✅ **해소** — `models.list`로 `gemini-3.5-flash` 사용 가능 확인 (§5.1) |
-| **Gemini SDK 패키지명이 문서와 다름** | 아직 미확인. 구형 `google-generativeai`와 신형 `google-genai`는 호출 방식이 다름 → 설치 직후 import 확인 |
+| ~~Gemini 모델명이 문서와 다름~~ | ✅ **해소** — `gemini-3.6-flash`로 확정. `models.list`에 있어도 404가 날 수 있음 (§5.1) |
+| ~~Gemini SDK 패키지명이 문서와 다름~~ | ✅ **해소** — `google-genai 2.18.1`, `from google import genai` 동작 확인 |
+| **Gemini 무료 한도 하루 20회 소진** | 실행 1회당 Gemini 2회 호출 → 하루 약 10회. **캐싱(§9) 필수.** 막히면 다른 flash 모델로 교체 (한도는 모델별) |
+| ~~LLM이 JSON을 코드블록으로 감싸 반환~~ | ✅ **해소** — 예시 블록 제거 + `response_schema` 적용 후 실패 0건 (§5.1) |
 | ~~Kakao 앱 플랫폼 미등록으로 403~~ | ✅ **해소** — 실제 호출 200 확인 (2026-08-18) |
+| ~~Gemini 503 과부하~~ | ✅ **대응** — 3회 백오프 재시도 (E4-a) |
 | ~~API 키 발급 지연~~ | ✅ **해소** — Gemini·Kakao 두 키 모두 발급 및 인증 확인 완료 |
-| **LLM이 JSON을 코드블록으로 감싸 반환** | `response_mime_type="application/json"` + 프롬프트에 "코드블록 없이" 명시. 그래도 오면 앞뒤 백틱 제거 후 파싱 |
+| **`strptime`이 `2026-9-20`을 통과시킴** | ✅ **해소** — `isoformat()` 왕복 비교 추가 (§4.2) |
+| **argparse 오류가 콘솔에서 깨짐** | ✅ **해소** — `sys.stderr`도 UTF-8로 고정 (§4.2) |
 | **`x`/`y`를 위경도로 뒤집어 저장** | §5.2 표대로 `x`=lng, `y`=lat (실측 검증됨). 문자열로 오므로 `float()` 변환 필수 |
 | 맛집 0건인데 LLM이 가게를 지어냄 | 리포트 프롬프트에 "지어내지 말 것" 명시 (§5.3), 원본 JSON과 대조 검증 |
 | **파싱 재시도가 무한 루프** | 재시도 카운터를 명시적으로 1로 제한. 과제 제약에 "무한 재시도 금지" 명시됨 |
@@ -937,7 +998,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 RESULTS_DIR = "results"
 KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
-GEMINI_MODEL = "gemini-3.5-flash"   # 정확한 ID는 models.list로 확인 (§5.1)
+GEMINI_MODEL = "gemini-3.6-flash"   # 정확한 ID는 models.list로 확인 (§5.1)
 RESTAURANT_COUNT = 5
 REQUEST_TIMEOUT = 10
 
