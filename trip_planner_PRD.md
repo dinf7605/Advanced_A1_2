@@ -281,7 +281,7 @@ def valid_date(s):
 | 항목 | 값 |
 |------|-----|
 | SDK | `google-genai` (`from google import genai`) |
-| 모델 | `gemini-2.5-flash` |
+| 모델 | `gemini-3.5-flash` |
 | 환경변수 | `GEMINI_API_KEY` |
 | 출력 강제 | `response_mime_type="application/json"` |
 
@@ -291,17 +291,30 @@ from google.genai import types
 
 client = genai.Client(api_key=api_key)
 response = client.models.generate_content(
-    model="gemini-2.5-flash",
+    model="gemini-3.5-flash",
     contents=prompt,
     config=types.GenerateContentConfig(response_mime_type="application/json"),
 )
 data = json.loads(response.text)
 ```
 
-> ⚠️ **Day 2에 확인할 것** — 모델명과 SDK 패키지명은 버전에 따라 달라집니다.
-> 구형 패키지 `google-generativeai`(`import google.generativeai as genai`)와
+> ✅ **모델 ID 검증 완료 (2026-08-18)** — `models.list` 호출 결과 `gemini-3.5-flash`가
+> 계정에서 사용 가능한 모델로 확인됐습니다. (같은 계열의 `gemini-3.5-flash-lite`도 있으므로
+> `-lite`를 잘못 붙이지 않도록 주의)
+>
+> 재확인이 필요하면 아래로 목록을 다시 뽑을 수 있습니다. **키 인증 확인을 겸합니다.**
+>
+> ```bash
+> curl -s -H "x-goog-api-key: $GEMINI_API_KEY" "https://generativelanguage.googleapis.com/v1beta/models" | grep -o '"name": "models/[^"]*"'
+> ```
+>
+> `401`/`403`이면 키 문제입니다.
+> (키를 URL 쿼리스트링이 아니라 `x-goog-api-key` 헤더로 보내는 이유는, 쿼리스트링에 담으면
+> 셸 히스토리·서버 접근 로그·프록시 로그에 키가 평문으로 남기 때문입니다)
+>
+> ⚠️ **아직 확인 안 된 것 — SDK 패키지.** 구형 `google-generativeai`(`import google.generativeai as genai`)와
 > 신형 `google-genai`(`from google import genai`)는 **호출 방식이 다릅니다.**
-> 발급 페이지의 현재 문서에서 모델명·설치 명령을 확인하고 이 절을 갱신하십시오.
+> 이 문서는 신형 기준으로 작성했습니다.
 
 **프롬프트 설계 원칙**
 
@@ -371,6 +384,23 @@ documents = resp.json()["documents"]
 | `place_url` | `url` | 카카오맵 상세 페이지 |
 | `x` | `lng` | **경도**. 문자열로 오므로 `float()` 변환 |
 | `y` | `lat` | **위도**. 문자열로 오므로 `float()` 변환 |
+
+> ✅ **실제 응답으로 검증 완료 (2026-08-18)** — `query="강릉 맛집"`, `category_group_code=FD6`으로
+> 호출한 결과 위 표의 필드가 전부 그대로 존재했습니다. 총 검색 건수 4,189건.
+>
+> ```
+> place_name        = '강릉 ○○코다리찜'
+> road_address_name = '강원특별자치도 강릉시 초당순두부길 96'
+> address_name      = '강원특별자치도 강릉시 초당동 12-3'
+> category_name     = '음식점 > 한식 > 코다리요리'
+> place_url         = 'http://place.map.kakao.com/25754890'
+> x                 = '128.91609322357172'   ← 경도, 문자열
+> y                 = '37.79104417963563'    ← 위도, 문자열
+> ```
+>
+> 강릉의 실제 좌표가 북위 37.8 / 동경 128.9이므로 **`x`=경도, `y`=위도가 맞습니다.**
+> 두 값이 **따옴표로 감싸인 문자열**인 것도 확인했습니다 → `float()` 변환 필수.
+> `distance`는 중심 좌표를 안 넘기면 빈 문자열(`''`)로 옵니다.
 
 > ⚠️ **`x`가 경도(lng), `y`가 위도(lat)입니다.** 화면 좌표 감각으로 `x=lat`이라고 넣기 쉬운데,
 > 그러면 지도에 찍었을 때 엉뚱한 곳(적도 근처 바다)이 나옵니다.
@@ -722,22 +752,23 @@ results/trip_{date}_raw.json 존재?
 
 ### Day 1 — 8/18(화) 환경 세팅 & 키 발급
 
-- [ ] `git init`, `.gitignore` 작성 (**`.env` 반드시 포함**)
-- [ ] Google AI Studio에서 **Gemini API 키 발급**
-- [ ] Kakao Developers에서 앱 생성 → **REST API 키 발급** (플랫폼 설정 확인)
-- [ ] `.env` 작성 + `.env.example` 작성
+- [x] `git init`, `.gitignore` 작성 (**`.env` 반드시 포함**)
+- [x] Google AI Studio에서 **Gemini API 키 발급**
+- [x] Kakao Developers에서 앱 생성 → **REST API 키 발급** (플랫폼 설정 확인)
+- [x] `.env` 작성 + `.env.example` 작성
 - [ ] `requirements.txt` — `google-genai`, `requests`, `python-dotenv`
 - [ ] `pip install -r requirements.txt`
 - [ ] `load_api_keys()` 구현 → **키를 지우고 실행해 종료 안내가 나오는지 확인** (E2)
 
-> 💡 Day 1에 두 API를 **각각 한 번씩 최소 호출**해 보십시오. 키 발급은 승인·설정 문제로
-> 막히는 일이 잦은데, 이걸 Day 4에 발견하면 일정이 통째로 밀립니다.
+> ✅ **두 API 모두 실호출 확인 완료 (2026-08-18)** — Gemini `models.list` 200,
+> Kakao 키워드 검색 200. 키 발급·인증 관련 리스크는 해소됐습니다.
 
 ### Day 2 — 8/19(수) CLI + 1차 추천
 
 - [ ] `argparse` 구성, `valid_date()` 검증 (§4.2)
 - [ ] 잘못된 날짜 5종 테스트 (T1~T5)
-- [ ] Gemini SDK 설치 방식·모델명 **현재 문서로 확인** (§5.1 경고)
+- [x] ~~모델명 확인~~ → `gemini-3.5-flash` 확정 (§5.1)
+- [ ] Gemini **SDK 설치 방식** 확인 — `pip install google-genai` 후 import 경로 확인
 - [ ] `get_recommendation()` 1차 버전 — 호출 + `json.loads`
 - [ ] 응답을 그대로 출력해 형식 확인
 
@@ -829,7 +860,7 @@ results/trip_{date}_raw.json 존재?
 - [ ] **맛집 0건/실패 시에도 리포트가 생성되는가** ← 요건 4·6의 핵심
 - [ ] **LLM 파싱 재시도가 최대 1회인가** (무한 루프 없음)
 - [ ] `try-except`로 네트워크·인증·파싱 오류 분리 처리
-- [ ] `.env` 사용 + `.gitignore`에 포함
+- [x] `.env` 사용 + `.gitignore`에 포함
 - [ ] **코드·README·로그·결과 파일·스크린샷 어디에도 실제 키가 없는가** (§8.4)
 - [ ] `README.md` — 개요 / 실행 방법 / 키 설정 / 결과 확인 / 키 주의사항
 - [ ] (보너스) 캐싱 동작 확인
@@ -874,11 +905,12 @@ A1-1과 동일하게 유지합니다.
 
 | 리스크 | 대응 |
 |--------|------|
-| **Gemini SDK 패키지명·모델명이 문서와 다름** | Day 2에 현재 공식 문서로 확인 후 §5.1 갱신. 구형 `google-generativeai`와 신형 `google-genai`는 호출 방식이 다름 |
-| Kakao 앱 플랫폼 미등록으로 403 | Day 1에 최소 1회 호출로 미리 확인 |
-| API 키 발급 지연 | Day 1에 발급 착수 (Day 4에 발견하면 일정 붕괴) |
+| ~~Gemini 모델명이 문서와 다름~~ | ✅ **해소** — `models.list`로 `gemini-3.5-flash` 사용 가능 확인 (§5.1) |
+| **Gemini SDK 패키지명이 문서와 다름** | 아직 미확인. 구형 `google-generativeai`와 신형 `google-genai`는 호출 방식이 다름 → 설치 직후 import 확인 |
+| ~~Kakao 앱 플랫폼 미등록으로 403~~ | ✅ **해소** — 실제 호출 200 확인 (2026-08-18) |
+| ~~API 키 발급 지연~~ | ✅ **해소** — Gemini·Kakao 두 키 모두 발급 및 인증 확인 완료 |
 | **LLM이 JSON을 코드블록으로 감싸 반환** | `response_mime_type="application/json"` + 프롬프트에 "코드블록 없이" 명시. 그래도 오면 앞뒤 백틱 제거 후 파싱 |
-| **`x`/`y`를 위경도로 뒤집어 저장** | §5.2 표대로 `x`=lng, `y`=lat. `float()` 변환 누락도 함께 확인 |
+| **`x`/`y`를 위경도로 뒤집어 저장** | §5.2 표대로 `x`=lng, `y`=lat (실측 검증됨). 문자열로 오므로 `float()` 변환 필수 |
 | 맛집 0건인데 LLM이 가게를 지어냄 | 리포트 프롬프트에 "지어내지 말 것" 명시 (§5.3), 원본 JSON과 대조 검증 |
 | **파싱 재시도가 무한 루프** | 재시도 카운터를 명시적으로 1로 제한. 과제 제약에 "무한 재시도 금지" 명시됨 |
 | 한글이 JSON에 `\uXXXX`로 저장됨 | `json.dump(..., ensure_ascii=False, indent=2)` |
@@ -905,7 +937,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 RESULTS_DIR = "results"
 KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
-GEMINI_MODEL = "gemini-2.5-flash"   # Day 2에 현재 문서로 확인
+GEMINI_MODEL = "gemini-3.5-flash"   # 정확한 ID는 models.list로 확인 (§5.1)
 RESTAURANT_COUNT = 5
 REQUEST_TIMEOUT = 10
 

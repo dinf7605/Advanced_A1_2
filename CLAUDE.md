@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | 항목 | 확정 | PRD |
 |------|------|-----|
-| LLM | Google Gemini (`google-genai`, `response_mime_type="application/json"`) | §5.1 |
+| LLM | Google Gemini **3.5 Flash** (`google-genai`, `response_mime_type="application/json"`) | §5.1 |
 | 지도/장소 | Kakao Local 키워드 검색 | §5.2 |
 | 보너스 | **캐싱만** 채택 — `recommended_city`는 **단수 문자열** | §0, §9 |
 | 파일 구성 | `trip_planner.py` 단일 파일 | §0 |
@@ -77,4 +77,5 @@ python trip_planner.py -date "2026-09-20"
 ## 주의
 
 Gemini SDK는 구형 `google-generativeai`와 신형 `google-genai`의 호출 방식이 다릅니다.
-모델명(`gemini-2.5-flash`)과 패키지명은 **현재 공식 문서로 확인 후** PRD §5.1을 갱신하십시오.
+모델은 **Gemini 3.5 Flash**로 확정됐지만, 문서의 ID 문자열 `gemini-3.5-flash`는 명명 규칙에서
+유추한 값입니다. **`models.list`로 실제 ID를 확인한 뒤** PRD §5.1과 코드 상수를 갱신하십시오.
