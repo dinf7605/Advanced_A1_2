@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | 항목 | 확정 | PRD |
 |------|------|-----|
-| LLM | Google Gemini **3.5 Flash** (`google-genai`, `response_mime_type="application/json"`) | §5.1 |
+| LLM | Google Gemini **`gemini-3.6-flash`** (`google-genai` 2.18.1) | §5.1 |
 | 지도/장소 | Kakao Local 키워드 검색 | §5.2 |
 | 보너스 | **캐싱만** 채택 — `recommended_city`는 **단수 문자열** | §0, §9 |
 | 파일 구성 | `trip_planner.py` 단일 파일 | §0 |
@@ -54,9 +54,8 @@ pip install -r requirements.txt
 python trip_planner.py -date "2026-09-20"
 ```
 
-테스트 프레임워크나 린터는 없습니다. 검증은 **PRD §13.1의 T1~T12 수동 시나리오**를
-직접 실행해 확인합니다. 특히 T7(Kakao 키를 틀리게 넣고도 리포트가 생성되는지)이
-이 과제의 핵심 요건을 증명하는 테스트입니다.
+산출물은 `results/trip_{-date값}_raw.json` 과 `results/trip_{-date값}_report.md` 입니다.
+파일명은 실행 날짜가 아니라 `-date` 값으로 붙습니다 (캐시가 이 이름을 키로 씁니다).
 
 ## 작업 관례 (A1-1에서 이어짐)
 
@@ -74,8 +73,28 @@ python trip_planner.py -date "2026-09-20"
   없으면 cp949 터미널에서 `UnicodeEncodeError`로 중단됩니다.
 - A1-1과 달리 **외부 라이브러리를 사용합니다** (`google-genai`, `requests`, `python-dotenv`).
 
-## 주의
+## 측정으로 확정된 것 (되돌리지 말 것)
 
-Gemini SDK는 구형 `google-generativeai`와 신형 `google-genai`의 호출 방식이 다릅니다.
-모델은 **Gemini 3.5 Flash**로 확정됐지만, 문서의 ID 문자열 `gemini-3.5-flash`는 명명 규칙에서
-유추한 값입니다. **`models.list`로 실제 ID를 확인한 뒤** PRD §5.1과 코드 상수를 갱신하십시오.
+아래는 전부 실제로 호출해 보고 확인한 사실입니다. "개선"이라며 되돌리지 마십시오.
+
+- **1차 추천 프롬프트에 예시 JSON 블록을 넣지 않는다.** 넣으면 모델이 예시를 먼저 출력하고
+  진짜 답을 이어 붙여 JSON 객체가 두 개가 됩니다. 실측 실패율: 예시 포함 5건 중 4건 실패,
+  예시 없이 산문 지시 10건 중 0건 실패. 구조는 `RECOMMEND_SCHEMA`가 강제합니다.
+- **`response_mime_type="application/json"`은 "JSON 하나만"을 보장하지 않는다.**
+- **날짜 검증에 `isoformat()` 왕복 비교가 필요하다.** `strptime`의 `%m`/`%d`는 0을 뺀
+  한 자리 표기를 허용해서 `2026-9-20`이 그냥 통과합니다.
+- **`sys.stderr`도 UTF-8로 고정해야 한다.** argparse 오류는 stderr로 나가므로,
+  stdout만 재설정하면 cp949 터미널에서 날짜 오류 안내가 깨집니다.
+- **Kakao `x`=경도, `y`=위도이고 둘 다 문자열이다.** 안동 응답 `x=128.72 / y=36.56`으로 확인.
+- **`models.list`에 있어도 호출 가능한 모델이 아니다.** `gemini-2.5-flash`는 목록에 나오지만
+  호출하면 `404 — no longer available to new users`가 납니다.
+- **Gemini 무료 한도는 모델별 하루 20회.** 전체 실행 1회에 2번 호출하므로 하루 약 10회분입니다.
+  막히면 다른 flash 계열로 모델만 바꾸면 됩니다 (한도가 모델별로 따로 잡힘).
+
+## 테스트
+
+테스트 프레임워크는 없습니다. PRD §13.1의 **T1~T12를 직접 실행**해 확인하며, 전부 통과한
+상태입니다. 코드를 고쳤으면 최소한 T5(정상)와 T7(Kakao 키를 틀리게 넣고도 리포트 생성)은
+다시 돌리십시오. **T7이 과제의 핵심 요건을 증명하는 테스트입니다.**
+
+API 호출 없이 확인 가능한 것: T1~T4(날짜 검증), T6(키 미설정), T8~T9(모듈 직접 호출), T11(캐시).
