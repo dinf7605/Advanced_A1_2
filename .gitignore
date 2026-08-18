@@ -1,0 +1,16 @@
+# 보안 — API 키가 담긴 파일. 절대 커밋하지 않는다.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 편집기
+.vscode/
+.claude/
+
+# OS
+Thumbs.db
+desktop.ini
